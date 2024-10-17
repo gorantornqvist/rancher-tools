@@ -1,0 +1,356 @@
+# ranchclu2argo
+# Created by goran.tornqvist@conoa.se
+# ***********************************
+# Dynamic registration of Rancher Downstream clusters to ArgoCD
+# Runs as a cronjob in a central management cluster where ArgoCD runs and a argocd cluster secret for a Rancher Cluster pre-exists.
+# * It connects to the Rancher Cluster and gets all downstream clusters (exluding local cluster)
+# * Loops thru the list of downstream clusters in Rancher and uses labels to check if a corresponding ArgoCD cluster secret exist
+# * If no secret exists it will create a Rancher token in Rancher and then create a ArgoCD cluster secret that uses the newly created token
+# * The token will be valid for 90 days by default and 1 day before it expires it will be replaced with a new token and the ArgoCD cluster secret will be updated as well
+#
+# SETUP:
+# * bitnami/kubectl:latest is used together with a bash script that performs all tasks
+# * The cronjob needs to run in the same namespace as argocd since it will mount the existing ArgoCD cluster secret for the Rancher Cluster and generate a kubeconfig
+# * A service account "ranchclu2argo" is used for all secret automation tasks in the ArgoCD cluster
+# * First create a local account with admin privilegies in your Rancher cluster - you need to specify this account in ranchclu2argo.conf later.
+# * Replace all occurrences of myranchercluster in this YAML file with the name of your Rancher server
+# * Update values in ranchclu2argo.conf
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ranchclu2argo
+  namespace: argocd
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - update
+  - patch
+  - create
+  - delete
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ranchclu2argo
+  namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ranchclu2argo
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ranchclu2argo
+subjects:
+- kind: ServiceAccount
+  name: ranchclu2argo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ranchclu2argo-myranchercluster
+  namespace: argocd
+data:
+  ranchclu2argo.conf: |
+    # debug: set to true to leave container running
+    do_not_exit=false
+
+    # if the downstream cluster doesnt exist in Rancher anymore, should the argocd cluster secret be removed?
+    cleanup_cluster_secrets=true
+
+    # Used when generating argocd cluster secret for downstream clusters, example
+    # server: https://$ranchercluster/k8s/clusters/$cluster
+    # (and in internal labels for this app)
+    ranchercluster=myranchercluster.mydomain.com
+
+    # base64 encoded ca-cert for Rancher instance
+    rancher_ca_cert=LS0tLS1C...
+
+    # Rancher account details when creating Rancher tokens
+    # for use with argocd (must be a local account)
+    rancheraccountid=u-qb6pm
+    rancheraccountname=mgmt-argo
+
+    # Number of days the tokens are valid for
+    token_valid_for=90
+
+  ranchclu2argo.sh: |
+    #!/bin/bash
+
+    set -e
+
+    die() {
+      echo $1
+      exit 99
+    }
+
+    BASE_PATH=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+    source $BASE_PATH/ranchclu2argo.conf || die "Could not source ranchclu2argo.conf"
+
+    test -d "/run/secrets/kubernetes.io/serviceaccount" || die "serviceaccount secret is not mounted"
+    echo "Configuring kubeconfig for in-cluster ..."
+    name=in-cluster
+    server=https://kubernetes.default.svc
+    test -f /run/secrets/kubernetes.io/serviceaccount/ca.crt && cadata=$(cat /run/secrets/kubernetes.io/serviceaccount/ca.crt | base64 -w 0) || die "ca.crt file does not exist in serviceaccount mount"
+    test -f /run/secrets/kubernetes.io/serviceaccount/token && token=$(cat /run/secrets/kubernetes.io/serviceaccount/token) || die "token file does not exist in serviceaccount mount"
+
+    echo "apiVersion: v1
+    kind: Config
+    clusters:
+    - name: $name
+      cluster:
+        server: $server
+        certificate-authority-data: $cadata
+    users:
+    - name: $name
+      user:
+        token: $token
+    contexts:
+    - name: $name
+      context:
+        user: $name
+        cluster: $name
+    current-context: $name
+    " > /.kube/kubeconfig-$name
+
+    test -d "/.kube/rancher-cluster" || die "argocd secret for rancher-cluster is not mounted"
+    echo "Configuring kubeconfig for rancher-cluster ..."
+    test -f /.kube/rancher-cluster/name && name=$(cat /.kube/rancher-cluster/name) || die "name is not set in rancher-cluster secret"
+    test -f /.kube/rancher-cluster/server && server=$(cat /.kube/rancher-cluster/server) || die "server is not set in rancher-cluster secret"
+    test -f /.kube/rancher-cluster/config && config=$(cat /.kube/rancher-cluster/config) || die "config is not set in rancher-cluster secret"
+    cadata=$(echo $config | jq -r -e '.tlsClientConfig.caData' || die "tlsClientConfig.caData is not set in config")
+    certdata=$(echo $config | jq -r -e '.tlsClientConfig.certData' || die "tlsClientConfig.certData is not set in config")
+    keydata=$(echo $config | jq -r -e '.tlsClientConfig.keyData' || die "tlsClientConfig.keyData is not set in config")
+
+    echo "apiVersion: v1
+    kind: Config
+    clusters:
+    - name: $name
+      cluster:
+        server: $server
+        certificate-authority-data: $cadata
+    users:
+    - name: $name
+      user:
+        client-certificate-data: $certdata
+        client-key-data: $keydata
+    contexts:
+    - name: $name
+      context:
+        user: $name
+        cluster: $name
+    current-context: $name
+    " > /.kube/kubeconfig-rancher-cluster
+
+    cd /opt/ranchclu2argo || die "Could not cd to working dir /opt/ranchclu2argo"
+
+    echo "Fetching and looping all downstream clusters (clusters.management.cattle.io) for rancher cluster $ranchercluster ..."
+    clusterlist=$(kubectl --kubeconfig /.kube/kubeconfig-rancher-cluster get clusters.management.cattle.io | grep '^c-' | awk '{ print $1 }')
+    for cluster in $clusterlist; do
+      echo
+      echo "***************************************************************************"
+      echo
+      echo "Fetching cluster details for cluster $cluster ..."
+      clusterdetails=$(kubectl --kubeconfig /.kube/kubeconfig-rancher-cluster get clusters.management.cattle.io $cluster -o json)
+      clustername=$(echo $clusterdetails | jq -e -r '.spec.displayName')
+      echo "Cluster name is $clustername ..."
+
+      echo "Fetching any existing argocd cluster secret matching labels ranchercluster $ranchercluster and clusterid $cluster ..."
+      clustersecret=$(kubectl --kubeconfig /.kube/kubeconfig-in-cluster get secret -n argocd --selector "argocd.argoproj.io/secret-type=cluster,ranchclu2argo/rancherCluster=$ranchercluster,ranchclu2argo/clusterId=$cluster" -o json)
+      # check if any item matched
+      if echo $clustersecret | jq -e -r '.items[0]' >/dev/null ; then
+        token_expires=$(echo $clustersecret | jq -e -r '.items[0].metadata.labels."ranchclu2argo/tokenExpires"')
+        # check if token expires tomorrow
+        recreate_token_and_secret="false"
+        if [ "$token_expires" == "$(date +%Y-%m-%d -d '+1 day')" ]; then
+          echo "Token for cluster $clustername expires tomorrow, token and secret needs to be recreated ..."
+          recreate_token_and_secret="true"
+        else
+          echo "OK: argocd cluster secret exist and is not about to expire ..."
+        fi
+      else
+        echo "No matching secret found, token and secret needs to be created ..."
+        recreate_token_and_secret="true"
+      fi
+
+      if [ "$recreate_token_and_secret" == "true" ]; then
+
+        token=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 53)
+
+        echo "Generating token manifest ..."
+        
+        expires_at=$(date +%Y-%m-%dT%H:%M:%S -d "+${token_valid_for} days")
+        # not 100% sure about token format, but this appears to work
+        echo "apiVersion: management.cattle.io/v3
+    kind: Token
+    metadata:
+      generateName: token-
+      labels:
+        authn.management.cattle.io/token-userId: $rancheraccountid
+    authProvider: local
+    clusterName: $cluster
+    current: false
+    description: $clustername - autogenerated by ranchclu2argo
+    expired: false
+    expiresAt: \"$expires_at\"
+    isDerived: true
+    lastUpdateTime: \"\"
+    token: $token
+    ttl: 7776000000
+    userId: $rancheraccountid
+    userPrincipal:
+      displayName: $rancheraccountname
+      loginName: $rancheraccountname
+      me: true
+      metadata:
+        creationTimestamp: null
+        name: local://$rancheraccountid
+      principalType: user
+      provider: local
+      " > $cluster-token.yaml
+
+        echo "Creating Rancher token for cluster $cluster ..."
+        tokenobject=$(kubectl --kubeconfig /.kube/kubeconfig-rancher-cluster create -f $cluster-token.yaml | awk '{ print $1 }')
+        tokenname=$(kubectl --kubeconfig /.kube/kubeconfig-rancher-cluster get $tokenobject -o "jsonpath={.metadata.name}")
+
+        token_expires=$(date +%Y-%m-%d -d "+${token_valid_for} days")
+        echo "Generating ArgoCD cluster secret manifest ..."
+        echo "apiVersion: v1
+    kind: Secret
+    metadata:
+      name: cluster-$clustername
+      namespace: argocd
+      labels:
+        argocd.argoproj.io/secret-type: cluster
+        ranchclu2argo/rancherCluster: $ranchercluster
+        ranchclu2argo/clusterId: $cluster
+        ranchclu2argo/tokenExpires: $token_expires
+    type: Opaque
+    stringData:
+      name: $clustername
+      server: https://$ranchercluster/k8s/clusters/$cluster
+      config: |
+        {
+          \"bearerToken\": \"$tokenname:$token\",
+          \"tlsClientConfig\": {
+            \"caData\": \"$rancher_ca_cert\"
+          }
+        }
+      " > $cluster-secret.yaml
+        echo "Creating ArgoCD cluster secret for cluster $cluster ..."
+        kubectl --kubeconfig /.kube/kubeconfig-in-cluster apply -f $cluster-secret.yaml
+      fi
+    done
+
+    echo
+    echo "***************************************************************************"
+    echo
+
+    if [ "$cleanup_cluster_secrets" == "true" ]; then
+      echo "Cleanup: Fetching all ArgoCD cluster secrets and checking if the downstream cluster (clusters.management.cattle.io) still exist and removes the cluster secret if it doesnt ..."
+      clusterlist=$(kubectl --kubeconfig /.kube/kubeconfig-in-cluster get secret -n argocd --selector "argocd.argoproj.io/secret-type=cluster,ranchclu2argo/rancherCluster=$ranchercluster" -o "jsonpath={.items[*].metadata.labels.ranchclu2argo/clusterId}")
+      for cluster in $clusterlist; do
+        echo "Checking if clusters.management.cattle.io $cluster exist ..."
+        if kubectl --kubeconfig /.kube/kubeconfig-rancher-cluster get clusters.management.cattle.io $cluster ; then
+          echo "OK: Downstream cluster $cluster still exist ..."
+        else
+          echo "Downstream cluster $cluster does not exist, removing ArgoCD cluster secret ..."
+          kubectl --kubeconfig /.kube/kubeconfig-in-cluster delete secret -n argocd --selector "argocd.argoproj.io/secret-type=cluster,ranchclu2argo/rancherCluster=$ranchercluster,ranchclu2argo/clusterId=$cluster"
+        fi
+        echo
+        echo "***************************************************************************"
+        echo
+      done
+    fi
+
+    if [ "$do_not_exit" == "true" ]; then
+      echo "do_not_exit: leaving container running ..."
+      tail -f /dev/null
+    else
+      echo "Completed successfully ..."
+      exit 0
+    fi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ranchclu2argo-myranchercluster
+  namespace: argocd
+spec:
+  schedule: "01 * * * *"
+  startingDeadlineSeconds: 300
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: kubectl
+            image: bitnami/kubectl:latest
+            imagePullPolicy: Always
+            command:
+            - '/bin/bash'
+            - '/usr/local/bin/ranchclu2argo.sh'
+            volumeMounts:
+              - mountPath: /.kube
+                name: kube
+              - mountPath: /opt/ranchclu2argo
+                name: ranchclu2argo-workdir
+              - name: ranchclu2argo-conf
+                mountPath: /usr/local/bin/ranchclu2argo.conf
+                subPath: ranchclu2argo.conf
+              - name: ranchclu2argo-script
+                mountPath: /usr/local/bin/ranchclu2argo.sh
+                subPath: ranchclu2argo.sh
+              - mountPath: "/.kube/rancher-cluster"
+                name: rancher-cluster
+                readOnly: true
+            resources:
+              requests:
+                memory: "32Mi"
+                cpu: "50m"
+              limits:
+                memory: "64Mi"
+                cpu: "500m"
+            securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                privileged: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 101
+                seccompProfile:
+                  type: RuntimeDefault
+          serviceAccount: ranchclu2argo
+          serviceAccountName: ranchclu2argo
+          volumes:
+          - emptyDir: {}
+            name: kube
+          - emptyDir: {}
+            name: ranchclu2argo-workdir
+          - configMap:
+              items:
+              - key: ranchclu2argo.conf
+                path: ranchclu2argo.conf
+              name: ranchclu2argo-myranchercluster
+            name: ranchclu2argo-conf
+          - configMap:
+              items:
+              - key: ranchclu2argo.sh
+                path: ranchclu2argo.sh
+              name: ranchclu2argo-myranchercluster
+            name: ranchclu2argo-script
+          - name: rancher-cluster
+            secret:
+              secretName: cluster-myranchercluster
