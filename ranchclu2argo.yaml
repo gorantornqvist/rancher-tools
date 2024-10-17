@@ -15,6 +15,7 @@
 # * First create a local account with admin privilegies in your Rancher cluster - you need to specify this account in ranchclu2argo.conf later.
 # * Replace all occurrences of myranchercluster in this YAML file with the name of your Rancher server
 # * Update values in ranchclu2argo.conf
+# * If you have multiple Rancher clusters / instances, just create a new configmap and cronjob with below as template and replace myranchercluster
 
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
