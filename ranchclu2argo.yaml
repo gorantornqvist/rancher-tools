@@ -162,27 +162,40 @@ data:
       echo "Fetching cluster details for cluster $cluster ..."
       clusterdetails=$(kubectl --kubeconfig /.kube/kubeconfig-rancher-cluster get clusters.management.cattle.io $cluster -o json)
       clustername=$(echo $clusterdetails | jq -e -r '.spec.displayName')
+      clusterlabels=$(echo $clusterdetails | jq -e -r '.metadata.labels | with_entries( select(.key|contains("ranchclu2argo")))' | yq -P)
+
       echo "Cluster name is $clustername ..."
+      echo "Cluster has ranchclu2argo labels:
+    $clusterlabels ...
+    "
 
       echo "Fetching any existing argocd cluster secret matching labels ranchercluster $ranchercluster and clusterid $cluster ..."
       clustersecret=$(kubectl --kubeconfig /.kube/kubeconfig-in-cluster get secret -n argocd --selector "argocd.argoproj.io/secret-type=cluster,ranchclu2argo/rancherCluster=$ranchercluster,ranchclu2argo/clusterId=$cluster" -o json)
       # check if any item matched
       if echo $clustersecret | jq -e -r '.items[0]' >/dev/null ; then
+        current_label_hash=$(echo $clustersecret | jq -r '.items[0].metadata.labels."ranchclu2argo/labelHash"')
         token_expires=$(echo $clustersecret | jq -e -r '.items[0].metadata.labels."ranchclu2argo/tokenExpires"')
-        # check if token expires tomorrow
-        recreate_token_and_secret="false"
-        if [ "$token_expires" == "$(date +%Y-%m-%d -d '+1 day')" ]; then
-          echo "Token for cluster $clustername expires tomorrow, token and secret needs to be recreated ..."
-          recreate_token_and_secret="true"
+        # check if token expires in a few days
+        recreate_token="false"
+        if [ "$token_expires" == "$(date +%Y-%m-%d -d '+3 days')" ]; then
+          echo "Token for cluster $clustername expires in 3 days, token and secret needs to be recreated ..."
+          recreate_token="true"
         else
           echo "OK: argocd cluster secret exist and is not about to expire ..."
         fi
+
+        new_label_hash=$(echo $clusterlabels | md5sum | awk '{ print $1 }')
+        if [ "$current_label_hash" != "$new_label_hash" ]; then
+          labels_changed=true
+        else
+          labels_changed=false
+        fi
       else
         echo "No matching secret found, token and secret needs to be created ..."
-        recreate_token_and_secret="true"
+        recreate_token="true"
       fi
 
-      if [ "$recreate_token_and_secret" == "true" ]; then
+      if [ "$recreate_token" == "true" ]; then
 
         token=$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 53)
 
@@ -223,17 +236,36 @@ data:
         tokenname=$(kubectl --kubeconfig /.kube/kubeconfig-rancher-cluster get $tokenobject -o "jsonpath={.metadata.name}")
 
         token_expires=$(date +%Y-%m-%d -d "+${token_valid_for} days")
-        echo "Generating ArgoCD cluster secret manifest ..."
-        echo "apiVersion: v1
+      fi
+
+      if [ "$recreate_token" == "true" -o "$labels_changed" == "true" ]; then
+
+        clustersecretlabels="argocd.argoproj.io/secret-type: cluster
+    ranchclu2argo/rancherCluster: $ranchercluster
+    ranchclu2argo/clusterId: $cluster
+    ranchclu2argo/tokenExpires: $token_expires
+    ranchclu2argo/labelHash: $new_label_hash
+    "
+        if [ "$clusterlabels" != '{}' ]; then
+          clustersecretlabels+=$clusterlabels
+        fi
+        OLD_IFS=$IFS
+        IFS=$'\n'
+        labels_indented=""
+        for label in $clustersecretlabels; do
+          labels_indented+="    $label\n"
+        done
+        IFS=$OLD_IFS
+
+        if [ "$recreate_token" == "true" ]; then
+          echo "Generating ArgoCD cluster secret manifest ..."
+          echo -e "apiVersion: v1
     kind: Secret
     metadata:
       name: cluster-$clustername
       namespace: argocd
       labels:
-        argocd.argoproj.io/secret-type: cluster
-        ranchclu2argo/rancherCluster: $ranchercluster
-        ranchclu2argo/clusterId: $cluster
-        ranchclu2argo/tokenExpires: $token_expires
+    $labels_indented
     type: Opaque
     stringData:
       name: $clustername
@@ -245,8 +277,19 @@ data:
             \"caData\": \"$rancher_ca_cert\"
           }
         }
-      " > $cluster-secret.yaml
-        echo "Creating ArgoCD cluster secret for cluster $cluster ..."
+    " > $cluster-secret.yaml
+        else
+          echo "Cluster labels changed in Rancher, updating the ArgoCD cluster secret metadata.labels (NOTE: removed cluster labels will not be touched and needs to be removed manually if needed) ..."
+          echo -e "apiVersion: v1
+    kind: Secret
+    metadata:
+      name: cluster-$clustername
+      namespace: argocd
+      labels:
+    $labels_indented
+    " > $cluster-secret.yaml
+        fi
+        echo "Applying ArgoCD cluster secret for cluster $cluster ..."
         kubectl --kubeconfig /.kube/kubeconfig-in-cluster apply -f $cluster-secret.yaml
       fi
     done
@@ -291,6 +334,7 @@ spec:
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
+      backoffLimit: 0
       template:
         spec:
           restartPolicy: Never
