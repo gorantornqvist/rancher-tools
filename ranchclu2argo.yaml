@@ -6,7 +6,8 @@
 # * It connects to the Rancher Cluster and gets all downstream clusters (exluding local cluster)
 # * Loops thru the list of downstream clusters in Rancher and uses labels to check if a corresponding ArgoCD cluster secret exist
 # * If no secret exists it will create a Rancher token in Rancher and then create a ArgoCD cluster secret that uses the newly created token
-# * The token will be valid for 90 days by default and 1 day before it expires it will be replaced with a new token and the ArgoCD cluster secret will be updated as well
+# * The token will be valid for 90 days by default and a few days before it expires it will be replaced with a new token and the ArgoCD cluster secret will be updated as well
+# * Any label named ranchclu2argo/something that exist on the downstream cluster in Rancher will be copied to the ArgoCD cluster secret. Note: if a label is removed, it will not be removed from the ArgoCD cluster secret.
 #
 # SETUP:
 # * bitnami/kubectl:latest is used together with a bash script that performs all tasks
